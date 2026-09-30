@@ -1,0 +1,32 @@
+# Dev Job Radar — minimal config
+# Fill in the REQUIRED fields, then run: dev-job-radar check
+# For all options, see config.template.yaml or run: dev-job-radar init --full
+
+profile:
+  name: ""              # REQUIRED — your name (used in email alerts)
+  target_title: ""      # REQUIRED — e.g. "Senior Software Engineer"
+
+search:
+  terms:                # REQUIRED — at least one search term
+    - ""                # e.g. "software engineer"
+  locations:            # REQUIRED — at least one location
+    - ""                # e.g. "San Francisco, CA"
+
+# Optional: uncomment to enable email alerts (requires Gmail App Password)
+# See README.md for setup instructions.
+# notifications:
+#   email:
+#     enabled: true
+#     username: you@gmail.com
+#     app_password: xxxx-xxxx-xxxx-xxxx
+#     to_address: you@gmail.com
+#   telegram:
+#     enabled: true
+#     bot_token: ""          # get from @BotFather
+#     chat_id: ""            # your chat ID
+#   slack:
+#     enabled: true
+#     webhook_url: ""        # https://hooks.slack.com/services/T.../B.../...
+#   discord:
+#     enabled: true
+#     webhook_url: ""        # https://discord.com/api/webhooks/ID/TOKEN
