@@ -185,6 +185,8 @@ COUNTRIES: dict[str, str] = {
     "egypt": "EG",
     "lebanon": "LB",
     "pakistan": "PK",
+    "morocco": "MA",
+    "maroc": "MA",
     "georgia": "GE",
 }
 

@@ -298,6 +298,23 @@ class TestLoadConfig:
         cfg = load_config(config_file)
         assert cfg.profile.name == "Test"
 
+    def test_valid_file_loads_utf8_search_terms(self, tmp_path):
+        from dev_job_radar.config import load_config
+        import yaml
+
+        config_file = tmp_path / "config.yaml"
+        raw = {
+            "profile": {"name": "Test", "target_title": "Engineer"},
+            "search": {"terms": ["Développeur java"], "locations": ["Morocco"]},
+        }
+        config_file.write_bytes(
+            yaml.dump(raw, allow_unicode=True).encode("utf-8")
+        )
+
+        cfg = load_config(config_file)
+
+        assert cfg.search.terms == ["Développeur java"]
+
     def test_invalid_config_raises_system_exit(self, tmp_path):
         from dev_job_radar.config import load_config
         import yaml

@@ -220,6 +220,7 @@ config.yaml
 
 # Local test configs
 test_config*.yaml
+config.indeed-no-date.yaml
 
 # Databases
 *.db

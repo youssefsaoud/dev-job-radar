@@ -697,7 +697,7 @@ def check():
 
     # 1. Parse YAML
     try:
-        with open(target) as f:
+        with open(target, encoding="utf-8") as f:
             raw = yaml.safe_load(f)
     except yaml.YAMLError as e:
         console.print(f"[red]YAML syntax error:[/red] {e}")

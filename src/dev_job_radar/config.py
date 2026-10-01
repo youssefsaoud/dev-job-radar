@@ -235,7 +235,7 @@ def load_config(path: Path | str | None = None) -> AppConfig:
     path = Path(path) if path else resolve_config_path()
     if not path.exists():
         raise SystemExit(f"Config not found at {path}. Run `dev-job-radar init` first.")
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     try:
         cfg = AppConfig(**raw)
