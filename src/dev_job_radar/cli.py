@@ -35,6 +35,7 @@ from dev_job_radar.scrapers import get_scraper
 
 app = typer.Typer(name="dev-job-radar", help="Dev Job Radar job monitoring.")
 console = Console()
+log = logging.getLogger("dev_job_radar.cli")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -113,6 +114,7 @@ def scrape(
     total_found = 0
     total_new = 0
     total_filtered = 0
+    seen_dedup_keys: set[str] = set()
 
     # Build task list for concurrent execution
     tasks = [
@@ -136,11 +138,6 @@ def scrape(
             jobs = scraper.scrape(params)
         except Exception as e:
             return s_name, s_term, s_loc, [], str(e)
-        # Score in worker thread (CPU-bound but fast)
-        for job in jobs:
-            score, breakdown = scorer.score(job)
-            job.score = score
-            job.score_breakdown = breakdown
         return s_name, s_term, s_loc, jobs, None
 
     max_workers = min(cfg.scraping.max_workers, len(tasks)) if tasks else 1
@@ -177,7 +174,15 @@ def scrape(
 
             page_new = 0
             for job in jobs:
+                if job.dedup_key in seen_dedup_keys:
+                    continue
+                seen_dedup_keys.add(job.dedup_key)
+
                 job.search_term = search_term
+                score, breakdown = scorer.score(job)
+                job.score = score
+                job.score_breakdown = breakdown
+
                 if job.score_breakdown.get("dealbreaker"):
                     job.status = "filtered"
                     total_filtered += 1
@@ -990,15 +995,16 @@ def rescore(
 
 
 @app.command()
-def digest():
+def digest(
+    limit: int = typer.Option(10, "--limit", help="Maximum qualifying jobs to include"),
+):
     """Send daily digest of top job matches via email, Telegram, Slack, and/or Discord."""
     from datetime import timedelta
     from dev_job_radar.notify import (
         send_email,
-        send_telegram,
+        send_telegram_job_alerts,
         send_slack,
         send_discord,
-        _esc_md,
         _esc_slack,
         _esc_discord,
     )
@@ -1013,6 +1019,7 @@ def digest():
         status="new", min_score=cfg.scoring.min_alert_score, since=cutoff, limit=None
     )
     jobs = _filter_alert_jobs(jobs, cfg)
+    jobs = jobs[:limit]
     stats = db.get_alert_stats(score_threshold=cfg.scoring.min_alert_score)
     db.close()
 
@@ -1020,14 +1027,13 @@ def digest():
         console.print("[dim]No new matches in the last 24h.[/dim]")
         return
 
-    display_jobs = jobs[:10]
     sent_any = False
     prefix = f"dev-job-radar ({profile_name})" if profile_name != "default" else "dev-job-radar"
 
     # Email digest
     if cfg.notifications.email.enabled:
         lines = [f"{prefix} digest — {len(jobs)} match(es) in the last 24h\n"]
-        for job in display_jobs:
+        for job in jobs:
             salary = job.compensation.display_concise if job.compensation else ""
             kw = job.score_breakdown.get("keyword", "?") if job.score_breakdown else "?"
             id_tag = f"#{job.id} " if job.id else ""
@@ -1051,35 +1057,13 @@ def digest():
 
     # Telegram digest
     if cfg.notifications.telegram.enabled:
-        if profile_name != "default":
-            tg_header = f"*Dev Job Radar \\({_esc_md(profile_name)}\\) digest* — {len(jobs)} match\\(es\\)\n"
-        else:
-            tg_header = f"*Dev Job Radar digest* — {len(jobs)} match\\(es\\)\n"
-        tg_lines = [tg_header]
-        for job in display_jobs:
-            salary = job.compensation.display_concise if job.compensation else ""
-            kw = job.score_breakdown.get("keyword", "?") if job.score_breakdown else "?"
-            id_tag = f"\\#{job.id} " if job.id else ""
-            loc_line = f"  {_esc_md(job.location.display)}"
-            if salary:
-                loc_line += f" \\| {_esc_md(salary)}"
-            tg_lines.append(
-                f"*{job.score}* \\(kw:{kw}\\) \\| {id_tag}[{_esc_md(job.company)}: {_esc_md(job.title)}]({job.url})\n"
-                f"{loc_line}"
-            )
-        tg_lines.append(
-            f"\n\U0001f4ca {_esc_md(str(stats['total_new']))} unreviewed \\| {_esc_md(str(stats['scraped_24h']))} scraped today"
-        )
-        if send_telegram(
-            text="\n".join(tg_lines),
-            cfg=cfg.notifications.telegram,
-        ):
+        if send_telegram_job_alerts(jobs, cfg.notifications.telegram):
             sent_any = True
 
     # Slack digest
     if cfg.notifications.slack.enabled:
         sl_lines = [f"*{prefix} digest* — {len(jobs)} match(es)\n"]
-        for job in display_jobs:
+        for job in jobs:
             salary = job.compensation.display_concise if job.compensation else ""
             kw = job.score_breakdown.get("keyword", "?") if job.score_breakdown else "?"
             id_tag = f"#{job.id} " if job.id else ""
@@ -1103,7 +1087,7 @@ def digest():
     # Discord digest
     if cfg.notifications.discord.enabled:
         dc_lines = [f"**{prefix} digest** — {len(jobs)} match(es)\n"]
-        for job in display_jobs:
+        for job in jobs:
             salary = job.compensation.display_concise if job.compensation else ""
             kw = job.score_breakdown.get("keyword", "?") if job.score_breakdown else "?"
             id_tag = f"#{job.id} " if job.id else ""

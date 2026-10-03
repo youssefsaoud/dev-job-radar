@@ -137,8 +137,68 @@ class TestDigestCommand:
         assert "Digest sent" in result.output
         mock_post.assert_called_once()
         text = mock_post.call_args.kwargs["json"]["text"]
+        assert "🎯 *NEW JOB*" in text
         assert "NVIDIA" in text
-        assert "digest" in text.lower()
+        assert "🔗 [View & Apply](https://example.com/tg1)" in text
+
+    @patch("dev_job_radar.notify.httpx.post")
+    def test_default_limit_is_10(self, mock_post, tmp_path):
+        """digest() includes 10 qualifying jobs by default."""
+        mock_post.return_value = MagicMock(status_code=200)
+
+        db_path = tmp_path / "test.db"
+        db = JobDB(db_path)
+        for i in range(12):
+            db.upsert_job(
+                _make_job(
+                    f"default-limit-{i}",
+                    score=100 - i,
+                    company=f"DefaultCo{i:02d}",
+                )
+            )
+        db.close()
+
+        cfg = _mock_cfg(db_path, telegram_enabled=True)
+
+        with patch("dev_job_radar.cli._get_config", return_value=cfg):
+            result = runner.invoke(app, ["digest"])
+
+        assert result.exit_code == 0
+        assert mock_post.call_count == 10
+        text = "\n".join(call.kwargs["json"]["text"] for call in mock_post.call_args_list)
+        for i in range(10):
+            assert f"DefaultCo{i:02d}" in text
+        assert "DefaultCo10" not in text
+        assert "DefaultCo11" not in text
+
+    @patch("dev_job_radar.notify.httpx.post")
+    def test_custom_limit_100(self, mock_post, tmp_path):
+        """digest --limit 100 can include more than the default 10 jobs."""
+        mock_post.return_value = MagicMock(status_code=200)
+
+        db_path = tmp_path / "test.db"
+        db = JobDB(db_path)
+        for i in range(25):
+            db.upsert_job(
+                _make_job(
+                    f"custom-limit-{i}",
+                    score=100 - i,
+                    company=f"CustomCo{i:02d}",
+                    title=f"Backend Engineer {i:02d}",
+                )
+            )
+        db.close()
+
+        cfg = _mock_cfg(db_path, telegram_enabled=True)
+
+        with patch("dev_job_radar.cli._get_config", return_value=cfg):
+            result = runner.invoke(app, ["digest", "--limit", "100"])
+
+        assert result.exit_code == 0
+        assert mock_post.call_count == 25
+        text = "\n".join(call.kwargs["json"]["text"] for call in mock_post.call_args_list)
+        for i in range(25):
+            assert f"CustomCo{i:02d}" in text
 
     @patch("dev_job_radar.notify.smtplib.SMTP")
     def test_sends_email(self, mock_smtp, tmp_path):
@@ -227,8 +287,43 @@ class TestDigestCommand:
         assert result.exit_code == 0
         # Should have sent -- CA job passes the filter
         assert "Digest sent" in result.output
+        mock_post.assert_called_once()
         text = mock_post.call_args.kwargs["json"]["text"]
-        assert "1 match" in text  # Only CA job, not TX
+        assert "🎯 *NEW JOB*" in text
+        assert "San Jose, CA" in text
+        assert "tx1" not in text
+
+    @patch("dev_job_radar.notify.httpx.post")
+    def test_digest_uses_one_job_per_telegram_message(self, mock_post, tmp_path):
+        """Telegram digest uses the same per-job presentation as live alerts."""
+        mock_post.return_value = MagicMock(status_code=200)
+
+        db_path = tmp_path / "test.db"
+        db = JobDB(db_path)
+        for i in range(3):
+            job = _make_job(
+                f"one-job-{i}",
+                score=80 - i,
+                company=f"DigestCo{i}",
+                title=f"Backend Engineer {i}",
+            )
+            job.id = 179 + i
+            db.upsert_job(job)
+        db.close()
+
+        cfg = _mock_cfg(db_path, telegram_enabled=True)
+
+        with patch("dev_job_radar.cli._get_config", return_value=cfg):
+            result = runner.invoke(app, ["digest", "--limit", "3"])
+
+        assert result.exit_code == 0
+        assert mock_post.call_count == 3
+        texts = [call.kwargs["json"]["text"] for call in mock_post.call_args_list]
+        assert all("🎯 *NEW JOB*" in text for text in texts)
+        assert all("View & Apply" in text for text in texts)
+        assert all("#179" not in text and "\\#179" not in text for text in texts)
+        for i, text in enumerate(texts):
+            assert f"DigestCo{i}" in text
 
     def test_no_notifications_configured(self, tmp_path):
         """digest() with no notification channels enabled prints failure."""

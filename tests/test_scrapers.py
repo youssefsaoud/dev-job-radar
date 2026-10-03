@@ -171,6 +171,49 @@ class TestIndeedScraper:
             assert jobs[0].company == "TechCo"
             assert jobs[0].source == Site.INDEED
 
+    def test_duplicate_jobs_in_one_response_are_deduped(self, scraping_config, params):
+        from dev_job_radar.scrapers.indeed import IndeedScraper
+
+        duplicate_job = {
+            "job": {
+                "key": "dup123",
+                "title": "Backend Engineer",
+                "description": {"html": "<p>Great job</p>"},
+                "location": {
+                    "city": "NYC",
+                    "admin1Code": "NY",
+                    "countryCode": "US",
+                    "formatted": {
+                        "short": "NYC",
+                        "long": "NYC, NY",
+                    },
+                },
+                "compensation": {},
+                "attributes": [],
+                "employer": {"name": "TechCo"},
+                "datePublished": 1711929600000,
+            }
+        }
+        scraper = IndeedScraper(scraping_config)
+        with respx.mock:
+            respx.post("https://apis.indeed.com/graphql").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "jobSearch": {
+                                "results": [duplicate_job, duplicate_job],
+                                "pageInfo": {"nextCursor": None},
+                            }
+                        }
+                    },
+                )
+            )
+            jobs = scraper.scrape(params)
+
+        assert len(jobs) == 1
+        assert jobs[0].source_id == "dup123"
+
     def test_morocco_search_uses_morocco_market_and_preserves_unicode(
         self, scraping_config
     ):

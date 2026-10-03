@@ -17,10 +17,13 @@ from dev_job_radar.config import (
 )
 from dev_job_radar.models import Compensation, CompInterval, Job, Location, Site
 from dev_job_radar.notify import (
+    TELEGRAM_SAFE_MESSAGE_LIMIT,
     Notifier,
     _esc_discord,
     _esc_md,
     _esc_slack,
+    build_telegram_job_alert,
+    build_telegram_job_messages,
     send_discord,
     send_slack,
     send_telegram,
@@ -29,12 +32,14 @@ from dev_job_radar.notify import (
 
 def _make_job(score=60, company="TestCo", title="ML Engineer", **kwargs):
     return Job(
-        source=Site.LINKEDIN,
-        source_id="test-123",
-        url="https://example.com/job/123",
+        source=kwargs.pop("source", Site.LINKEDIN),
+        source_id=kwargs.pop("source_id", "test-123"),
+        url=kwargs.pop("url", "https://example.com/job/123"),
         title=title,
         company=company,
-        location=Location(city="San Jose", state="CA", is_remote=False),
+        location=kwargs.pop(
+            "location", Location(city="San Jose", state="CA", is_remote=False)
+        ),
         description="A great ML job",
         date_posted=date.today(),
         date_scraped=datetime.now(),
@@ -96,7 +101,7 @@ class TestSendTelegram:
 class TestNotifierTelegram:
     @patch("dev_job_radar.notify.httpx.post")
     @patch("subprocess.run")
-    def test_notify_telegram_sends_for_jobs(self, mock_subprocess, mock_post):
+    def test_one_job_sends_one_telegram_message(self, mock_subprocess, mock_post):
         mock_post.return_value = MagicMock(status_code=200)
         cfg = NotificationsConfig(
             macos=MacOSNotifyConfig(enabled=False),
@@ -104,15 +109,173 @@ class TestNotifierTelegram:
             telegram=TelegramConfig(enabled=True, bot_token="123:ABC", chat_id="42"),
         )
         notifier = Notifier(cfg)
-        jobs = [_make_job(score=70), _make_job(score=60, company="OtherCo")]
 
-        notifier.notify_new_jobs(jobs)
+        notifier.notify_new_jobs([_make_job(score=70)])
 
         mock_post.assert_called_once()
         payload = mock_post.call_args.kwargs["json"]
         assert "42" == payload["chat_id"]
+        assert "🎯 *NEW JOB*" in payload["text"]
         assert "70" in payload["text"]
-        assert "OtherCo" in payload["text"]
+
+    @patch("dev_job_radar.notify.httpx.post")
+    @patch("subprocess.run")
+    def test_ten_jobs_send_ten_telegram_messages(self, mock_subprocess, mock_post):
+        mock_post.return_value = MagicMock(status_code=200)
+        cfg = NotificationsConfig(
+            macos=MacOSNotifyConfig(enabled=False),
+            email=EmailConfig(enabled=False),
+            telegram=TelegramConfig(enabled=True, bot_token="123:ABC", chat_id="42"),
+        )
+        notifier = Notifier(cfg)
+        jobs = [_make_job(score=60 + i, company=f"Co{i}") for i in range(10)]
+
+        notifier.notify_new_jobs(jobs)
+
+        assert mock_post.call_count == 10
+        texts = [call.kwargs["json"]["text"] for call in mock_post.call_args_list]
+        for i in range(10):
+            assert f"Co{i}" in texts[i]
+
+    @patch("dev_job_radar.notify.httpx.post")
+    @patch("subprocess.run")
+    def test_job_fields_render_in_mobile_friendly_format(
+        self, mock_subprocess, mock_post
+    ):
+        mock_post.return_value = MagicMock(status_code=200)
+        cfg = NotificationsConfig(
+            macos=MacOSNotifyConfig(enabled=False),
+            email=EmailConfig(enabled=False),
+            telegram=TelegramConfig(enabled=True, bot_token="123:ABC", chat_id="42"),
+        )
+        notifier = Notifier(cfg)
+        job = _make_job(score=75, company="NVIDIA", title="Backend Engineer")
+        job.id = 179
+
+        notifier.notify_new_jobs([job])
+
+        text = mock_post.call_args.kwargs["json"]["text"]
+        assert "🎯 *NEW JOB*" in text
+        assert "*Backend Engineer*" in text
+        assert "NVIDIA" in text
+        assert "📍 San Jose, CA" in text
+        assert "⭐ Score: 75" in text
+        assert "🔑 Keyword score: 40" in text
+        assert "🌐 LinkedIn" in text
+        assert "💰 $180k\\-$250k" in text
+        assert "🔗 [View & Apply](https://example.com/job/123)" in text
+        assert "#179" not in text
+        assert "\\#179" not in text
+
+    def test_telegram_alert_escapes_markdown_v2_fields(self):
+        job = _make_job(
+            title="Java (Spring) Developer + APIs",
+            company="ACME_[Labs]!",
+            location=Location(city="Casablanca (Remote)", state="MA", is_remote=True),
+        )
+
+        text = build_telegram_job_alert(job)
+
+        assert _esc_md("Java (Spring) Developer + APIs") in text
+        assert _esc_md("ACME_[Labs]!") in text
+        assert _esc_md("Casablanca (Remote), MA, (Remote)") in text
+        assert "🏠 Remote" in text
+
+    def test_telegram_chunk_builder_keeps_jobs_complete_and_unique(self):
+        jobs = [
+            _make_job(
+                score=70,
+                company=f"ChunkCo{i:03d}",
+                title=f"Backend Engineer {i:03d} " + ("Spring Boot " * 10),
+            )
+            for i in range(45)
+        ]
+
+        messages = build_telegram_job_messages(jobs, max_chars=1200)
+
+        assert len(messages) > 1
+        assert all(len(message) <= 1200 for message in messages)
+        combined = "\n".join(messages)
+        for i in range(45):
+            assert combined.count(f"ChunkCo{i:03d}") == 1
+
+    @patch("dev_job_radar.notify.httpx.post")
+    @patch("subprocess.run")
+    def test_oversized_job_alert_is_shortened(self, mock_subprocess, mock_post):
+        mock_post.return_value = MagicMock(status_code=200)
+        cfg = NotificationsConfig(
+            macos=MacOSNotifyConfig(enabled=False),
+            email=EmailConfig(enabled=False),
+            telegram=TelegramConfig(enabled=True, bot_token="123:ABC", chat_id="42"),
+        )
+        notifier = Notifier(cfg)
+        job = _make_job(
+            score=70,
+            company="VeryLongCompanyName" * 80,
+            title="Very long backend engineering title " * 200,
+        )
+
+        notifier.notify_new_jobs([job])
+
+        mock_post.assert_called_once()
+        text = mock_post.call_args.kwargs["json"]["text"]
+        assert len(text) <= TELEGRAM_SAFE_MESSAGE_LIMIT
+        assert "https://example.com/job/123" in text
+
+    @patch("dev_job_radar.notify.httpx.post")
+    @patch("subprocess.run")
+    def test_failed_telegram_job_send_is_logged_and_next_job_still_sends(
+        self, mock_subprocess, mock_post, caplog
+    ):
+        mock_post.side_effect = [
+            MagicMock(status_code=400, text="Bad Request: message is too long"),
+            MagicMock(status_code=200),
+        ]
+        cfg = NotificationsConfig(
+            macos=MacOSNotifyConfig(enabled=False),
+            email=EmailConfig(enabled=False),
+            telegram=TelegramConfig(enabled=True, bot_token="123:ABC", chat_id="42"),
+        )
+        notifier = Notifier(cfg)
+        jobs = [
+            _make_job(score=70, company="FailCo"),
+            _make_job(score=71, company="NextCo"),
+        ]
+
+        with caplog.at_level("ERROR", logger="dev_job_radar.notify"):
+            notifier.notify_new_jobs(jobs)
+
+        assert mock_post.call_count == 2
+        assert "Telegram job alert 1/2 failed" in caplog.text
+        assert "NextCo" in mock_post.call_args_list[1].kwargs["json"]["text"]
+
+    @patch("dev_job_radar.notify.httpx.post")
+    @patch("subprocess.run")
+    def test_job_formatting_failure_does_not_stop_next_job(
+        self, mock_subprocess, mock_post, caplog
+    ):
+        mock_post.return_value = MagicMock(status_code=200)
+        cfg = NotificationsConfig(
+            macos=MacOSNotifyConfig(enabled=False),
+            email=EmailConfig(enabled=False),
+            telegram=TelegramConfig(enabled=True, bot_token="123:ABC", chat_id="42"),
+        )
+        notifier = Notifier(cfg)
+
+        with (
+            patch(
+                "dev_job_radar.notify.build_telegram_job_alert",
+                side_effect=[ValueError("bad format"), "ok"],
+            ),
+            caplog.at_level("ERROR", logger="dev_job_radar.notify"),
+        ):
+            notifier.notify_new_jobs(
+                [_make_job(source_id="bad"), _make_job(source_id="good")]
+            )
+
+        mock_post.assert_called_once()
+        assert mock_post.call_args.kwargs["json"]["text"] == "ok"
+        assert "Telegram job alert formatting failed for source_id=bad" in caplog.text
 
     @patch("dev_job_radar.notify.httpx.post")
     @patch("subprocess.run")
@@ -218,6 +381,32 @@ class TestNotifyFormatConcise:
 
         text = mock_post.call_args.kwargs["json"]["text"]
         assert "No salary" not in text
+        assert "💰" not in text
+
+    @patch("dev_job_radar.notify.httpx.post")
+    @patch("subprocess.run")
+    def test_telegram_remote_line_only_when_applicable(
+        self, mock_subprocess, mock_post
+    ):
+        mock_post.return_value = MagicMock(status_code=200)
+        cfg = NotificationsConfig(
+            macos=MacOSNotifyConfig(enabled=False),
+            email=EmailConfig(enabled=False),
+            telegram=TelegramConfig(enabled=True, bot_token="123:ABC", chat_id="42"),
+        )
+        notifier = Notifier(cfg)
+        local_job = _make_job(score=70, source_id="local")
+        remote_job = _make_job(
+            score=71,
+            source_id="remote",
+            location=Location(city="Remote", is_remote=True),
+        )
+
+        notifier.notify_new_jobs([local_job, remote_job])
+
+        texts = [call.kwargs["json"]["text"] for call in mock_post.call_args_list]
+        assert "🏠 Remote" not in texts[0]
+        assert "🏠 Remote" in texts[1]
 
     @patch("dev_job_radar.notify.httpx.post")
     @patch("subprocess.run")
@@ -233,9 +422,10 @@ class TestNotifyFormatConcise:
         jobs = [_make_job(score=60 + i, company=f"Co{i}") for i in range(15)]
         notifier.notify_new_jobs(jobs)
 
-        text = mock_post.call_args.kwargs["json"]["text"]
-        # Job #15 (Co14) should be present — old code capped at 10
-        assert "Co14" in text
+        texts = [call.kwargs["json"]["text"] for call in mock_post.call_args_list]
+        # Job #15 (Co14) should be sent — old code capped at 10
+        assert mock_post.call_count == 15
+        assert "Co14" in texts[-1]
 
     @patch("subprocess.run")
     def test_email_uses_concise_salary(self, mock_subprocess):
@@ -320,7 +510,7 @@ class TestNotifierProfileName:
 
     @patch("dev_job_radar.notify.httpx.post")
     @patch("subprocess.run")
-    def test_telegram_prefix_default(self, mock_subprocess, mock_post):
+    def test_telegram_uses_job_alert_header(self, mock_subprocess, mock_post):
         mock_post.return_value = MagicMock(status_code=200)
         cfg = NotificationsConfig(
             macos=MacOSNotifyConfig(enabled=False),
@@ -331,12 +521,11 @@ class TestNotifierProfileName:
         notifier.notify_new_jobs([_make_job()])
 
         text = mock_post.call_args.kwargs["json"]["text"]
-        assert "Dev Job Radar" in text
-        assert "Dev Job Radar \\(" not in text
+        assert "🎯 *NEW JOB*" in text
 
     @patch("dev_job_radar.notify.httpx.post")
     @patch("subprocess.run")
-    def test_telegram_prefix_named(self, mock_subprocess, mock_post):
+    def test_telegram_job_alert_omits_profile_name(self, mock_subprocess, mock_post):
         mock_post.return_value = MagicMock(status_code=200)
         cfg = NotificationsConfig(
             macos=MacOSNotifyConfig(enabled=False),
@@ -347,7 +536,7 @@ class TestNotifierProfileName:
         notifier.notify_new_jobs([_make_job()])
 
         text = mock_post.call_args.kwargs["json"]["text"]
-        assert "frontend" in text
+        assert "frontend" not in text
 
     @patch("subprocess.run")
     def test_email_subject_named(self, mock_subprocess):
