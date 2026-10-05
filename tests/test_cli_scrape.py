@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
@@ -48,6 +50,22 @@ def _make_job(source_id: str, *, title: str = "Software Engineer") -> Job:
         location=Location(city="Casablanca", country="MA"),
         description="python backend developer building APIs " * 10,
     )
+
+
+def _mock_paths(tmp_path):
+    return SimpleNamespace(
+        profile_name="default",
+        db=tmp_path / "test.db",
+        logs=tmp_path / "logs",
+        reports=tmp_path / "reports",
+    )
+
+
+def _read_scrape_log(log_path):
+    for handler in logging.getLogger().handlers:
+        if getattr(handler, "_dev_job_radar_scrape_log", False):
+            handler.flush()
+    return log_path.read_text(encoding="utf-8")
 
 
 class TestScrapeZeroResultWarning:
@@ -251,3 +269,147 @@ class TestScrapeRunDedup:
         assert [row["jobs_new"] for row in runs] == [1, 0]
         first_notifier.notify_new_jobs.assert_called_once()
         second_notifier.notify_new_jobs.assert_not_called()
+
+
+class TestScrapeFileLogging:
+    def test_creates_log_file_and_logs_start_result_and_completion(self, tmp_path):
+        """scrape writes a persistent rotating log file for unattended runs."""
+        raw = {
+            **MINIMAL_RAW,
+            "search": {
+                **MINIMAL_RAW["search"],
+                "terms": ["python"],
+                "locations": ["Morocco"],
+                "sites": ["indeed"],
+            },
+            "scraping": {"max_workers": 1},
+        }
+        cfg = AppConfig(**raw)
+        cfg._config_path = tmp_path / "config.yaml"
+        paths = _mock_paths(tmp_path)
+
+        mock_scraper = MagicMock()
+        mock_scraper.scrape.return_value = [_make_job("log-1")]
+
+        with (
+            patch("dev_job_radar.cli._get_config", return_value=cfg),
+            patch("dev_job_radar.cli.resolve_data_paths", return_value=paths),
+            patch("dev_job_radar.cli.get_scraper", return_value=mock_scraper),
+        ):
+            result = runner.invoke(app, ["scrape", "--dry-run"])
+
+        log_path = paths.logs / "dev-job-radar.log"
+        assert result.exit_code == 0
+        assert "Scraped indeed" in result.output
+        assert log_path.exists()
+        text = _read_scrape_log(log_path)
+        assert "Scrape run started" in text
+        assert f"config={cfg._config_path}" in text
+        assert "sites=indeed" in text
+        assert "terms=python" in text
+        assert "locations=Morocco" in text
+        assert "Indeed | python | Morocco | 1 jobs found" in text
+        assert "Scrape completed" in text
+        assert "returned=1" in text
+        assert "duration=" in text
+
+    def test_scraper_error_is_logged_with_context_and_traceback(self, tmp_path):
+        cfg = AppConfig(**MINIMAL_RAW)
+        cfg._config_path = tmp_path / "config.yaml"
+        paths = _mock_paths(tmp_path)
+
+        class FailingScraper:
+            def scrape(self, params):
+                raise RuntimeError("network down")
+
+        with (
+            patch("dev_job_radar.cli._get_config", return_value=cfg),
+            patch("dev_job_radar.cli.resolve_data_paths", return_value=paths),
+            patch("dev_job_radar.cli.get_scraper", return_value=FailingScraper()),
+        ):
+            result = runner.invoke(app, ["scrape", "--dry-run"])
+
+        log_path = paths.logs / "dev-job-radar.log"
+        assert result.exit_code == 0
+        assert "Error scraping linkedin" in result.output
+        text = _read_scrape_log(log_path)
+        assert "Scrape request failed | site=linkedin | term=python | location=Remote" in text
+        assert "Traceback" in text
+        assert "RuntimeError: network down" in text
+        assert "Scrape request error recorded" in text
+        assert "Scrape completed" in text
+
+    def test_unexpected_exception_is_logged_with_traceback(self, tmp_path):
+        cfg = AppConfig(**MINIMAL_RAW)
+        cfg._config_path = tmp_path / "config.yaml"
+        paths = _mock_paths(tmp_path)
+
+        mock_scraper = MagicMock()
+        mock_scraper.scrape.return_value = [_make_job("boom")]
+
+        with (
+            patch("dev_job_radar.cli._get_config", return_value=cfg),
+            patch("dev_job_radar.cli.resolve_data_paths", return_value=paths),
+            patch("dev_job_radar.cli.get_scraper", return_value=mock_scraper),
+            patch(
+                "dev_job_radar.cli.JobScorer.score",
+                side_effect=RuntimeError("scorer exploded"),
+            ),
+        ):
+            result = runner.invoke(app, ["scrape", "--dry-run"])
+
+        log_path = paths.logs / "dev-job-radar.log"
+        assert result.exit_code != 0
+        text = _read_scrape_log(log_path)
+        assert "Scrape terminated unexpectedly" in text
+        assert "Traceback" in text
+        assert "RuntimeError: scorer exploded" in text
+
+    def test_secrets_are_not_written_to_scrape_log(self, tmp_path):
+        raw = {
+            **MINIMAL_RAW,
+            "notifications": {
+                "telegram": {
+                    "enabled": True,
+                    "bot_token": "123:SECRET_TOKEN",
+                    "chat_id": "secret-chat",
+                },
+                "email": {
+                    "enabled": True,
+                    "username": "me@example.com",
+                    "app_password": "email-secret",
+                    "to_address": "me@example.com",
+                },
+                "slack": {
+                    "enabled": True,
+                    "webhook_url": "https://hooks.slack.com/services/SECRET",
+                },
+                "discord": {
+                    "enabled": True,
+                    "webhook_url": "https://discord.com/api/webhooks/SECRET",
+                },
+            },
+            "bot": {"gemini_api_key": "gemini-secret"},
+        }
+        cfg = AppConfig(**raw)
+        cfg._config_path = tmp_path / "config.yaml"
+        paths = _mock_paths(tmp_path)
+
+        mock_scraper = MagicMock()
+        mock_scraper.scrape.return_value = []
+
+        with (
+            patch("dev_job_radar.cli._get_config", return_value=cfg),
+            patch("dev_job_radar.cli.resolve_data_paths", return_value=paths),
+            patch("dev_job_radar.cli.get_scraper", return_value=mock_scraper),
+        ):
+            result = runner.invoke(app, ["scrape", "--dry-run"])
+
+        assert result.exit_code == 0
+        text = _read_scrape_log(paths.logs / "dev-job-radar.log")
+        assert "SECRET_TOKEN" not in text
+        assert "secret-chat" not in text
+        assert "email-secret" not in text
+        assert "hooks.slack.com" not in text
+        assert "discord.com/api/webhooks" not in text
+        assert "gemini-secret" not in text

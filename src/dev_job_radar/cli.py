@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Annotated
 
@@ -36,6 +38,9 @@ from dev_job_radar.scrapers import get_scraper
 app = typer.Typer(name="dev-job-radar", help="Dev Job Radar job monitoring.")
 console = Console()
 log = logging.getLogger("dev_job_radar.cli")
+SCRAPE_LOG_FILE = "dev-job-radar.log"
+SCRAPE_LOG_MAX_BYTES = 2 * 1024 * 1024
+SCRAPE_LOG_BACKUP_COUNT = 5
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,6 +83,56 @@ def _get_db(cfg: AppConfig | None = None):
     return JobDB(path)
 
 
+def _configure_scrape_file_logging(log_dir: Path) -> Path:
+    """Attach a rotating file handler for unattended scrape runs."""
+    log_path = log_dir / SCRAPE_LOG_FILE
+    root = logging.getLogger()
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        resolved = str(log_path.resolve())
+    except OSError as e:
+        for handler in list(root.handlers):
+            if getattr(handler, "_dev_job_radar_scrape_log", False):
+                root.removeHandler(handler)
+                handler.close()
+        log.warning("Scrape file logging unavailable at %s: %s", log_path, e)
+        return log_path
+
+    for handler in list(root.handlers):
+        if getattr(handler, "_dev_job_radar_scrape_log", False):
+            if getattr(handler, "baseFilename", None) == resolved:
+                return log_path
+            root.removeHandler(handler)
+            handler.close()
+
+    try:
+        handler = RotatingFileHandler(
+            log_path,
+            maxBytes=SCRAPE_LOG_MAX_BYTES,
+            backupCount=SCRAPE_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+    except OSError as e:
+        for handler in list(root.handlers):
+            if getattr(handler, "_dev_job_radar_scrape_log", False):
+                root.removeHandler(handler)
+                handler.close()
+        log.warning("Scrape file logging unavailable at %s: %s", log_path, e)
+        return log_path
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    handler._dev_job_radar_scrape_log = True
+    root.addHandler(handler)
+    if root.level > logging.INFO:
+        root.setLevel(logging.INFO)
+    return log_path
+
+
 def _filter_alert_jobs(jobs: list, cfg) -> list:
     """Filter jobs by alert_states config: remote, state in allowed list, or unknown state."""
     allowed = cfg.scoring.alert_states
@@ -100,10 +155,13 @@ def scrape(
     ),
 ):
     """Run scrapers, score jobs, store results, and notify on new matches."""
+    run_started_perf = time.perf_counter()
     cfg = _get_config()
+    paths = resolve_data_paths(cfg._config_path or resolve_config_path(), cfg)
+    log_path = _configure_scrape_file_logging(paths.logs)
+    config_path = cfg._config_path or resolve_config_path()
     db = _get_db(cfg) if not dry_run else None
     scorer = JobScorer(cfg.profile)
-    paths = resolve_data_paths(cfg._config_path or resolve_config_path(), cfg)
     notifier = Notifier(cfg.notifications, profile_name=paths.profile_name)
 
     sites = [site] if site else cfg.search.sites
@@ -114,7 +172,20 @@ def scrape(
     total_found = 0
     total_new = 0
     total_filtered = 0
+    total_returned = 0
+    total_existing = 0
+    total_run_dedup_skipped = 0
     seen_dedup_keys: set[str] = set()
+
+    log.info(
+        "Scrape run started | config=%s | sites=%s | terms=%s | locations=%s | dry_run=%s | log=%s",
+        config_path,
+        ", ".join(sites),
+        ", ".join(terms),
+        ", ".join(locations),
+        dry_run,
+        log_path,
+    )
 
     # Build task list for concurrent execution
     tasks = [
@@ -126,6 +197,12 @@ def scrape(
 
     def _run_one(task):
         s_name, s_term, s_loc = task
+        log.info(
+            "Scrape request started | site=%s | term=%s | location=%s",
+            s_name,
+            s_term,
+            s_loc,
+        )
         params = ScrapeParams(
             search_term=s_term,
             location=s_loc,
@@ -137,96 +214,140 @@ def scrape(
             scraper = get_scraper(s_name, cfg.scraping)
             jobs = scraper.scrape(params)
         except Exception as e:
+            log.exception(
+                "Scrape request failed | site=%s | term=%s | location=%s",
+                s_name,
+                s_term,
+                s_loc,
+            )
             return s_name, s_term, s_loc, [], str(e)
         return s_name, s_term, s_loc, jobs, None
 
-    max_workers = min(cfg.scraping.max_workers, len(tasks)) if tasks else 1
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {
-            pool.submit(_run_one, task): (task, datetime.now()) for task in tasks
-        }
-        for future in as_completed(futures):
-            task, started_at = futures[future]
-            site_name, search_term, location, jobs, error = future.result()
+    try:
+        max_workers = min(cfg.scraping.max_workers, len(tasks)) if tasks else 1
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_run_one, task): (task, datetime.now()) for task in tasks
+            }
+            for future in as_completed(futures):
+                task, started_at = futures[future]
+                site_name, search_term, location, jobs, error = future.result()
 
-            run = ScrapeRun(
-                site=Site(site_name),
-                search_term=search_term,
-                location=location,
-                started_at=started_at,
-            )
-            run_id = db.record_run(run) if db else None
-
-            if error:
-                console.print(f"[red]Error scraping {site_name}: {error}[/red]")
-                if db and run_id:
-                    db.finish_run(run_id, 0, 0, error)
-                continue
-
-            if jobs:
-                console.print(
-                    f'[dim]Scraped {site_name}: "{search_term}" in {location} — {len(jobs)} jobs[/dim]'
+                run = ScrapeRun(
+                    site=Site(site_name),
+                    search_term=search_term,
+                    location=location,
+                    started_at=started_at,
                 )
-            else:
-                console.print(
-                    f'[yellow]Warning: {site_name} returned 0 jobs for "{search_term}" in {location}[/yellow]'
-                )
+                run_id = db.record_run(run) if db else None
 
-            page_new = 0
-            for job in jobs:
-                if job.dedup_key in seen_dedup_keys:
-                    continue
-                seen_dedup_keys.add(job.dedup_key)
-
-                job.search_term = search_term
-                score, breakdown = scorer.score(job)
-                job.score = score
-                job.score_breakdown = breakdown
-
-                if job.score_breakdown.get("dealbreaker"):
-                    job.status = "filtered"
-                    total_filtered += 1
-                    if db:
-                        db.upsert_job(job)
-                    elif dry_run:
-                        console.print(
-                            f"  [dim]{job.score}[/dim] | {job.company}: {job.title} | [red]dealbreaker[/red]"
-                        )
+                if error:
+                    log.error(
+                        "Scrape request error recorded | site=%s | term=%s | location=%s | error=%s",
+                        site_name,
+                        search_term,
+                        location,
+                        error,
+                    )
+                    console.print(f"[red]Error scraping {site_name}: {error}[/red]")
+                    if db and run_id:
+                        db.finish_run(run_id, 0, 0, error)
                     continue
 
-                total_found += 1
+                log.info(
+                    "%s | %s | %s | %s jobs found",
+                    site_name.title(),
+                    search_term,
+                    location,
+                    len(jobs),
+                )
+                total_returned += len(jobs)
 
-                if db:
-                    is_new, job_id = db.upsert_job(job)
-                    job.id = job_id
-                    if is_new:
-                        page_new += 1
-                        total_new += 1
-                        if job.score >= cfg.scoring.min_alert_score:
-                            if _filter_alert_jobs([job], cfg):
-                                new_high_score.append(job)
-                elif dry_run and job.score >= cfg.scoring.min_display_score:
+                if jobs:
                     console.print(
-                        f"  [green]{job.score}[/green] | {job.company}: {job.title} | {job.location.display}"
+                        f'[dim]Scraped {site_name}: "{search_term}" in {location} — {len(jobs)} jobs[/dim]'
+                    )
+                else:
+                    console.print(
+                        f'[yellow]Warning: {site_name} returned 0 jobs for "{search_term}" in {location}[/yellow]'
                     )
 
-            if db and run_id:
-                db.finish_run(run_id, len(jobs), page_new)
+                page_new = 0
+                for job in jobs:
+                    if job.dedup_key in seen_dedup_keys:
+                        total_run_dedup_skipped += 1
+                        continue
+                    seen_dedup_keys.add(job.dedup_key)
 
-    parts = [f"Found {total_found} jobs", f"{total_new} new"]
-    if total_filtered:
-        parts.append(f"{total_filtered} filtered by dealbreakers")
-    console.print(f"\n[bold]Done.[/bold] {', '.join(parts)}.")
+                    job.search_term = search_term
+                    score, breakdown = scorer.score(job)
+                    job.score = score
+                    job.score_breakdown = breakdown
 
-    if new_high_score and not dry_run:
-        new_high_score.sort(key=lambda j: j.score, reverse=True)
-        console.print(
-            f"[bold green]{len(new_high_score)} new high-score matches![/bold green]"
+                    if job.score_breakdown.get("dealbreaker"):
+                        job.status = "filtered"
+                        total_filtered += 1
+                        if db:
+                            db.upsert_job(job)
+                        elif dry_run:
+                            console.print(
+                                f"  [dim]{job.score}[/dim] | {job.company}: {job.title} | [red]dealbreaker[/red]"
+                            )
+                        continue
+
+                    total_found += 1
+
+                    if db:
+                        is_new, job_id = db.upsert_job(job)
+                        job.id = job_id
+                        if is_new:
+                            page_new += 1
+                            total_new += 1
+                            if job.score >= cfg.scoring.min_alert_score:
+                                if _filter_alert_jobs([job], cfg):
+                                    new_high_score.append(job)
+                        else:
+                            total_existing += 1
+                    elif dry_run and job.score >= cfg.scoring.min_display_score:
+                        console.print(
+                            f"  [green]{job.score}[/green] | {job.company}: {job.title} | {job.location.display}"
+                        )
+
+                if db and run_id:
+                    db.finish_run(run_id, len(jobs), page_new)
+
+        parts = [f"Found {total_found} jobs", f"{total_new} new"]
+        if total_filtered:
+            parts.append(f"{total_filtered} filtered by dealbreakers")
+        console.print(f"\n[bold]Done.[/bold] {', '.join(parts)}.")
+
+        if new_high_score and not dry_run:
+            new_high_score.sort(key=lambda j: j.score, reverse=True)
+            console.print(
+                f"[bold green]{len(new_high_score)} new high-score matches![/bold green]"
+            )
+            notifier.notify_new_jobs(new_high_score)
+
+        duration = time.perf_counter() - run_started_perf
+        log.info(
+            "Scrape completed | returned=%s | processed=%s | run_dedup_skipped=%s | new=%s | existing=%s | filtered=%s | qualifying=%s | notifications_attempted=%s | duration=%.1fs",
+            total_returned,
+            total_found,
+            total_run_dedup_skipped,
+            total_new,
+            total_existing,
+            total_filtered,
+            len(new_high_score),
+            bool(new_high_score and not dry_run),
+            duration,
         )
-        notifier.notify_new_jobs(new_high_score)
-
-    if db:
-        db.close()
+    except Exception:
+        duration = time.perf_counter() - run_started_perf
+        log.exception("Scrape terminated unexpectedly | duration=%.1fs", duration)
+        raise
+    finally:
+        if db:
+            db.close()
 
 
 @app.command("list")
